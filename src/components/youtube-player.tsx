@@ -31,14 +31,17 @@ declare global {
 function loadYouTubeIframeApi(): Promise<void> {
   if (typeof window === "undefined") return Promise.resolve();
 
+  // 1. Return immediately if YT.Player is already ready
   if (window.YT && window.YT.Player) {
     return Promise.resolve();
   }
 
+  // 2. Return shared in-flight promise if cached
   if (window.__echoYTReady) {
     return window.__echoYTReady;
   }
 
+  // 3. Create script tag and chain onYouTubeIframeAPIReady
   window.__echoYTReady = new Promise<void>((resolve) => {
     const existingScript = document.querySelector('script[src*="iframe_api"]');
     if (!existingScript) {
@@ -60,6 +63,7 @@ function loadYouTubeIframeApi(): Promise<void> {
       resolve();
     };
 
+    // Polling fallback in case callback already fired
     const interval = setInterval(() => {
       if (window.YT && window.YT.Player) {
         clearInterval(interval);
@@ -76,13 +80,6 @@ function loadYouTubeIframeApi(): Promise<void> {
   return window.__echoYTReady;
 }
 
-/** Android WebView wrappers (HopWeb, Median, GoNative…) contain "; wv)". */
-function detectBlockedWebView(): boolean {
-  if (typeof navigator === "undefined") return false;
-  const ua = navigator.userAgent || "";
-  return /; wv\)/.test(ua) || /HopWeb/i.test(ua);
-}
-
 export const YouTubePlayer = forwardRef<YouTubePlayerHandle, YouTubePlayerProps>(
   function YouTubePlayer(
     {
@@ -97,20 +94,15 @@ export const YouTubePlayer = forwardRef<YouTubePlayerHandle, YouTubePlayerProps>
   ) {
     const containerRef = useRef<HTMLDivElement>(null);
     const playerRef = useRef<any>(null);
-    const audioRef = useRef<HTMLAudioElement | null>(null);
-    const engineRef = useRef<"yt" | "html5">("yt");
-    // Sticky flag: once the iframe proves unusable (blocked WebView / embed
-    // error), skip it for the rest of the session and go straight to HTML5.
-    const ytBlockedRef = useRef<boolean>(false);
     const isPlayerReadyRef = useRef<boolean>(false);
-    const currentVideoIdRef = useRef<string>(initialVideoId);
     const pendingRef = useRef<{ videoId: string; autoplay: boolean } | null>(null);
     const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
-    const watchdogRef = useRef<NodeJS.Timeout | null>(null);
-    const playRetryRef = useRef<NodeJS.Timeout | null>(null);
     // Captured once so the construction effect never re-runs on track change.
     const initialVideoIdRef = useRef<string>(initialVideoId);
+    // Buffering nudge interval (never used to bypass gesture requirements).
+    const playRetryRef = useRef<NodeJS.Timeout | null>(null);
 
+    // Keep latest callbacks in ref without triggering reconstruction effect
     const callbacksRef = useRef({
       onPlayingChange,
       onTimeChange,
@@ -129,139 +121,84 @@ export const YouTubePlayer = forwardRef<YouTubePlayerHandle, YouTubePlayerProps>
       };
     });
 
-    // ── HTML5 fallback engine helpers ─────────────────────────────────────
-    const clearWatchdog = () => {
-      if (watchdogRef.current) {
-        clearTimeout(watchdogRef.current);
-        watchdogRef.current = null;
-      }
-    };
-
-    const startHtml5Engine = (videoId: string, autoplay: boolean) => {
-      const audio = audioRef.current;
-      if (!audio) return;
-
-      engineRef.current = "html5";
-      clearWatchdog();
-      if (playRetryRef.current) {
-        clearInterval(playRetryRef.current);
-        playRetryRef.current = null;
-      }
-
-      const src = `/api/music/stream/${videoId}?t=${Date.now()}`;
-      // Synchronous swap — mirrors `audio.src = url;` from the click tick.
-      audio.src = src;
-      audio.load();
-
-      if (autoplay) {
-        // If the stream redirect takes a moment, attempt play on canplay too.
-        const tryPlay = () => {
-          try {
-            const p = audio.play();
-            if (p && typeof p.then === "function") {
-              p.then(() => {
-                callbacksRef.current.onPlayingChange?.(true);
-              }).catch((error: unknown) => {
-                console.error("Playback blocked by browser strict policy:", error);
-                callbacksRef.current.onPlayingChange?.(false);
-              });
-            }
-          } catch (err) {
-            console.error("Playback blocked by browser strict policy:", err);
-            callbacksRef.current.onPlayingChange?.(false);
-          }
-        };
-
-        if (audio.readyState >= 2) {
-          tryPlay();
-        } else {
-          audio.addEventListener("canplay", tryPlay, { once: true });
-          // Hard cap: if the stream never becomes playable, surface an error
-          // so the app's resolve/next-track recovery kicks in.
-          setTimeout(() => {
-            if (engineRef.current === "html5" && audio.paused && audio.currentTime === 0) {
-              audio.removeEventListener("canplay", tryPlay);
-              callbacksRef.current.onPlayingChange?.(false);
-              callbacksRef.current.onError?.(150);
-            }
-          }, 10000);
-        }
-      }
-    };
-
-    const armWatchdog = (videoId: string) => {
-      clearWatchdog();
-      watchdogRef.current = setTimeout(() => {
-        if (engineRef.current === "yt") {
-          console.warn(
-            "YouTube IFrame engine did not start playback; switching to HTML5 stream fallback."
-          );
-          ytBlockedRef.current = true;
-          startHtml5Engine(videoId, true);
-        }
-      }, 6000);
-    };
-
-    // ── Imperative API ────────────────────────────────────────────────────
     useImperativeHandle(ref, () => ({
       /**
        * MUST be called synchronously inside a user gesture (onClick).
-       * Swaps the source and starts playback immediately — no awaits.
+       * Swaps the source and starts playback immediately — no timers, no awaits.
+       * Mirrors the strict HTML5 `audio.src = url; audio.play()` contract.
        */
       load: (videoId: string, autoplay: boolean = true) => {
         if (!videoId) return;
-        currentVideoIdRef.current = videoId;
-
-        // If the iframe is known-bad on this device, go straight to HTML5.
-        if (ytBlockedRef.current) {
-          startHtml5Engine(videoId, autoplay);
-          return;
-        }
 
         if (isPlayerReadyRef.current && playerRef.current) {
-          engineRef.current = "yt";
           try {
             const request = { videoId, suggestedQuality: "hd1080" as const };
+
             if (autoplay) {
+              // 1) Swap source  2) play() — both synchronous, same gesture tick.
               playerRef.current.loadVideoById?.(request);
-              playerRef.current.playVideo?.();
-              armWatchdog(videoId);
+              const playPromise = playerRef.current.playVideo?.();
+
+              // YT returns undefined, but if a Promise-like is returned (or the
+              // underlying <video> promise leaks through) handle it strictly.
+              if (playPromise !== undefined && typeof playPromise?.then === "function") {
+                playPromise
+                  .then(() => {
+                    callbacksRef.current.onPlayingChange?.(true);
+                  })
+                  .catch((error: unknown) => {
+                    console.error("Playback blocked by browser strict policy:", error);
+                    callbacksRef.current.onPlayingChange?.(false);
+                  });
+              }
+
+              // Buffering safety net: the gesture has already been consumed
+              // above, so this only nudges a source that is still spinning up.
+              if (playRetryRef.current) clearInterval(playRetryRef.current);
+              const retryStart = Date.now();
+              playRetryRef.current = setInterval(() => {
+                const state = playerRef.current?.getPlayerState?.();
+                // 1 = PLAYING, 3 = BUFFERING (both fine, stop nudging)
+                if (state === 1 || Date.now() - retryStart > 4000) {
+                  if (playRetryRef.current) clearInterval(playRetryRef.current);
+                  playRetryRef.current = null;
+                  if (state !== 1 && Date.now() - retryStart > 4000) {
+                    callbacksRef.current.onPlayingChange?.(false);
+                  }
+                  return;
+                }
+                if (state === 5 || state === 2 || state === -1) {
+                  try {
+                    playerRef.current?.playVideo?.();
+                  } catch {}
+                }
+              }, 250);
             } else {
               playerRef.current.cueVideoById?.(request);
             }
           } catch (err) {
             console.error("Playback blocked by browser strict policy:", err);
-            ytBlockedRef.current = true;
-            startHtml5Engine(videoId, autoplay);
+            callbacksRef.current.onPlayingChange?.(false);
           }
         } else {
+          // Player not constructed yet — queue it and replay inside onReady.
           pendingRef.current = { videoId, autoplay };
-          if (autoplay) armWatchdog(videoId);
         }
       },
-
       play: (): Promise<void> => {
-        if (engineRef.current === "html5") {
-          const audio = audioRef.current;
-          if (!audio) return Promise.reject(new Error("Audio engine unavailable"));
-          try {
-            const p = audio.play();
-            return p && typeof p.then === "function"
-              ? p.then(() => undefined)
-              : Promise.resolve();
-          } catch (err) {
-            return Promise.reject(err);
-          }
-        }
-
         if (!isPlayerReadyRef.current || !playerRef.current?.playVideo) {
           return Promise.reject(new Error("Player not ready"));
         }
+
+        // Fire synchronously inside the caller's gesture tick.
         try {
           playerRef.current.playVideo();
         } catch (err) {
           return Promise.reject(err);
         }
+
+        // Resolve when the player genuinely reaches PLAYING (state 1),
+        // reject if it never starts (blocked by autoplay policy).
         return new Promise<void>((resolve, reject) => {
           const started = Date.now();
           const check = setInterval(() => {
@@ -276,12 +213,7 @@ export const YouTubePlayer = forwardRef<YouTubePlayerHandle, YouTubePlayerProps>
           }, 100);
         });
       },
-
       pause: () => {
-        if (engineRef.current === "html5") {
-          audioRef.current?.pause();
-          return;
-        }
         if (isPlayerReadyRef.current && playerRef.current?.pauseVideo) {
           try {
             playerRef.current.pauseVideo();
@@ -290,17 +222,7 @@ export const YouTubePlayer = forwardRef<YouTubePlayerHandle, YouTubePlayerProps>
           }
         }
       },
-
       seek: (seconds: number) => {
-        if (engineRef.current === "html5") {
-          const audio = audioRef.current;
-          if (audio && isFinite(seconds)) {
-            try {
-              audio.currentTime = seconds;
-            } catch {}
-          }
-          return;
-        }
         if (isPlayerReadyRef.current && playerRef.current?.seekTo) {
           try {
             playerRef.current.seekTo(seconds, true);
@@ -309,16 +231,10 @@ export const YouTubePlayer = forwardRef<YouTubePlayerHandle, YouTubePlayerProps>
           }
         }
       },
-
       setVolume: (volume: number) => {
-        const v = Math.max(0, Math.min(100, volume));
-        if (engineRef.current === "html5") {
-          if (audioRef.current) audioRef.current.volume = v / 100;
-          return;
-        }
         if (isPlayerReadyRef.current && playerRef.current?.setVolume) {
           try {
-            playerRef.current.setVolume(v);
+            playerRef.current.setVolume(Math.max(0, Math.min(100, volume)));
           } catch (err) {
             console.error("Player setVolume error:", err);
           }
@@ -326,57 +242,12 @@ export const YouTubePlayer = forwardRef<YouTubePlayerHandle, YouTubePlayerProps>
       },
     }));
 
-    // ── HTML5 <audio> element: pre-initialized once on mount ─────────────
-    useEffect(() => {
-      const audio = new Audio();
-      audio.preload = "auto";
-      audio.setAttribute("playsinline", "true");
-      audio.crossOrigin = "anonymous";
-      audioRef.current = audio;
-
-      const onPlay = () => {
-        clearWatchdog();
-        callbacksRef.current.onPlayingChange?.(true);
-      };
-      const onPause = () => callbacksRef.current.onPlayingChange?.(false);
-      const onEndedEv = () => {
-        callbacksRef.current.onPlayingChange?.(false);
-        callbacksRef.current.onEnded?.();
-      };
-      const onErrorEv = () => {
-        if (engineRef.current !== "html5" || !audio.src) return;
-        console.error("HTML5 audio stream failed; requesting app-level recovery.");
-        clearWatchdog();
-        callbacksRef.current.onPlayingChange?.(false);
-        // Reuse the app's embed-error recovery (resolve candidates / next).
-        callbacksRef.current.onError?.(150);
-      };
-
-      audio.addEventListener("play", onPlay);
-      audio.addEventListener("pause", onPause);
-      audio.addEventListener("ended", onEndedEv);
-      audio.addEventListener("error", onErrorEv);
-
-      // Detect a blocked WebView up-front so the very first tap never waits.
-      if (detectBlockedWebView()) {
-        ytBlockedRef.current = true;
-      }
-
-      return () => {
-        audio.removeEventListener("play", onPlay);
-        audio.removeEventListener("pause", onPause);
-        audio.removeEventListener("ended", onEndedEv);
-        audio.removeEventListener("error", onErrorEv);
-        audio.pause();
-        audio.removeAttribute("src");
-        audioRef.current = null;
-      };
-    }, []);
-
-    // ── YouTube IFrame engine: mounts exactly once ───────────────────────
     useEffect(() => {
       let isMounted = true;
 
+      // Guard: construct the iframe EXACTLY once for the lifetime of the app.
+      // Rebuilding it on track change destroys the user-gesture context and is
+      // the primary reason mobile browsers refused to autoplay on first tap.
       if (playerRef.current) return;
 
       loadYouTubeIframeApi().then(() => {
@@ -385,6 +256,7 @@ export const YouTubePlayer = forwardRef<YouTubePlayerHandle, YouTubePlayerProps>
         }
         if (playerRef.current) return;
 
+        // Clean any existing element
         containerRef.current.innerHTML = "";
         const playerDiv = document.createElement("div");
         containerRef.current.appendChild(playerDiv);
@@ -406,32 +278,30 @@ export const YouTubePlayer = forwardRef<YouTubePlayerHandle, YouTubePlayerProps>
               onReady: () => {
                 if (!isMounted) return;
                 isPlayerReadyRef.current = true;
+                // Force highest playback quality on ready
                 try {
                   playerRef.current?.setPlaybackQuality?.("hd1080");
                 } catch {}
                 callbacksRef.current.onReady?.();
 
+                // Replay pending playback command if queued before ready
                 if (pendingRef.current && playerRef.current) {
                   const { videoId, autoplay } = pendingRef.current;
                   pendingRef.current = null;
                   const request = { videoId, suggestedQuality: "hd1080" as const };
-                  if (autoplay && !ytBlockedRef.current) {
-                    engineRef.current = "yt";
+                  if (autoplay) {
                     playerRef.current.loadVideoById?.(request);
                     playerRef.current.playVideo?.();
-                    armWatchdog(videoId);
-                  } else if (autoplay) {
-                    startHtml5Engine(videoId, true);
                   } else {
                     playerRef.current.cueVideoById?.(request);
                   }
                 }
               },
               onStateChange: (event: { data: number }) => {
-                if (!isMounted || engineRef.current !== "yt") return;
+                if (!isMounted) return;
                 const state = event.data;
+                // 1: PLAYING, 2: PAUSED, 5: CUED, 0: ENDED
                 if (state === 1) {
-                  clearWatchdog();
                   callbacksRef.current.onPlayingChange?.(true);
                 } else if (state === 2 || state === 5) {
                   callbacksRef.current.onPlayingChange?.(false);
@@ -443,14 +313,7 @@ export const YouTubePlayer = forwardRef<YouTubePlayerHandle, YouTubePlayerProps>
               onError: (event: { data: number }) => {
                 if (!isMounted) return;
                 console.warn("YouTube Player error event code:", event.data);
-                clearWatchdog();
-                // Try the direct stream for the same video before giving up.
-                if (currentVideoIdRef.current && engineRef.current === "yt") {
-                  ytBlockedRef.current = true;
-                  startHtml5Engine(currentVideoIdRef.current, true);
-                } else {
-                  callbacksRef.current.onError?.(event.data);
-                }
+                callbacksRef.current.onError?.(event.data);
               },
             },
           });
@@ -459,15 +322,8 @@ export const YouTubePlayer = forwardRef<YouTubePlayerHandle, YouTubePlayerProps>
         }
       });
 
-      // Poll current time / duration every 500ms from the active engine.
+      // Poll current time and duration every 500ms
       pollIntervalRef.current = setInterval(() => {
-        if (engineRef.current === "html5") {
-          const a = audioRef.current;
-          if (a) {
-            callbacksRef.current.onTimeChange?.(a.currentTime || 0, a.duration || 0);
-          }
-          return;
-        }
         if (isPlayerReadyRef.current && playerRef.current) {
           try {
             const currentTime = playerRef.current.getCurrentTime?.() || 0;
@@ -481,9 +337,13 @@ export const YouTubePlayer = forwardRef<YouTubePlayerHandle, YouTubePlayerProps>
 
       return () => {
         isMounted = false;
-        if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
-        if (playRetryRef.current) clearInterval(playRetryRef.current);
-        clearWatchdog();
+        if (pollIntervalRef.current) {
+          clearInterval(pollIntervalRef.current);
+        }
+        if (playRetryRef.current) {
+          clearInterval(playRetryRef.current);
+          playRetryRef.current = null;
+        }
         if (playerRef.current?.destroy) {
           try {
             playerRef.current.destroy();
