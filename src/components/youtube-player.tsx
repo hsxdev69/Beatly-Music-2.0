@@ -101,6 +101,9 @@ export const YouTubePlayer = forwardRef<YouTubePlayerHandle, YouTubePlayerProps>
     const initialVideoIdRef = useRef<string>(initialVideoId);
     // Buffering nudge interval (never used to bypass gesture requirements).
     const playRetryRef = useRef<NodeJS.Timeout | null>(null);
+    // Silent Keep-Alive HTML5 <audio> — prevents mobile browsers from suspending
+    // the tab/iframe when the app is backgrounded or the screen is off.
+    const keepAliveRef = useRef<HTMLAudioElement>(null);
 
     // Keep latest callbacks in ref without triggering reconstruction effect
     const callbacksRef = useRef({
@@ -120,6 +123,37 @@ export const YouTubePlayer = forwardRef<YouTubePlayerHandle, YouTubePlayerProps>
         onReady,
       };
     });
+
+    // --- Silent Keep-Alive controls ---
+    // Playing a looping silent HTML5 <audio> element makes the browser register
+    // an active media session, which prevents Chrome / Android WebView from
+    // suspending the tab (and thus the YouTube iframe) when backgrounded.
+    function startKeepAlive() {
+      const el = keepAliveRef.current;
+      if (!el) return;
+      try {
+        el.volume = 0;
+        el.muted = false; // must NOT be muted, or it won't hold the media session
+        const p = el.play();
+        if (p && typeof (p as Promise<void>).catch === "function") {
+          (p as Promise<void>).catch(() => {
+            // Autoplay may be blocked until a gesture; it will start on next play tap.
+          });
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    function stopKeepAlive() {
+      const el = keepAliveRef.current;
+      if (!el) return;
+      try {
+        el.pause();
+      } catch {
+        // ignore
+      }
+    }
 
     useImperativeHandle(ref, () => ({
       /**
@@ -302,10 +336,15 @@ export const YouTubePlayer = forwardRef<YouTubePlayerHandle, YouTubePlayerProps>
                 const state = event.data;
                 // 1: PLAYING, 2: PAUSED, 5: CUED, 0: ENDED
                 if (state === 1) {
+                  // Keep-alive: start silent audio so the browser keeps the tab
+                  // awake in the background while YouTube plays.
+                  startKeepAlive();
                   callbacksRef.current.onPlayingChange?.(true);
                 } else if (state === 2 || state === 5) {
+                  stopKeepAlive();
                   callbacksRef.current.onPlayingChange?.(false);
                 } else if (state === 0) {
+                  stopKeepAlive();
                   callbacksRef.current.onPlayingChange?.(false);
                   callbacksRef.current.onEnded?.();
                 }
@@ -344,6 +383,7 @@ export const YouTubePlayer = forwardRef<YouTubePlayerHandle, YouTubePlayerProps>
           clearInterval(playRetryRef.current);
           playRetryRef.current = null;
         }
+        try { keepAliveRef.current?.pause(); } catch {}
         if (playerRef.current?.destroy) {
           try {
             playerRef.current.destroy();
@@ -359,12 +399,24 @@ export const YouTubePlayer = forwardRef<YouTubePlayerHandle, YouTubePlayerProps>
     }, []);
 
     return (
-      <div
-        className="youtube-engine"
-        ref={containerRef}
-        aria-hidden="true"
-      />
+      <>
+        <div
+          className="youtube-engine"
+          ref={containerRef}
+          aria-hidden="true"
+        />
+        {/* Silent Keep-Alive audio — keeps the tab/iframe awake in the background */}
+        {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
+        <audio
+          ref={keepAliveRef}
+          id="keep-alive-audio"
+          src="data:audio/mp3;base64,SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU4LjI5LjEwMAAAAAAAAAAAAAAA//OEAAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAAEAAABIAD+//7+////////////////////////////////////////////////////////AAAAAExhdmYAAAAAAAAAAAAAAAAAAAAAAAD/84QAAAAAAAAAAAAAAAAAAAAAAA=="
+          loop
+          preload="auto"
+          aria-hidden="true"
+          style={{ display: "none" }}
+        />
+      </>
     );
   }
 );
-Le2
